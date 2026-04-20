@@ -35,14 +35,15 @@ esac
 
 # --- Find a usable Python -------------------------------------------------------
 find_python() {
-  local candidates=(python3.12 python3.11 python3.10 python3.9 python3)
+  local candidates=(python3.12 python3.11 python3.10 python3.9 python3.13 python3)
   for p in "${candidates[@]}"; do
     if command -v "$p" >/dev/null 2>&1; then
-      local v
-      v="$("$p" -c 'import sys; print("%d.%d"%sys.version_info[:2])' 2>/dev/null || true)"
-      case "$v" in
-        3.9|3.10|3.11|3.12) echo "$p"; return 0 ;;
-      esac
+      # Accept any Python >= 3.9. 3.12 is preferred (ordered first) because
+      # PyTorch stable wheels target it; 3.13 works too on recent torch.
+      if "$p" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' 2>/dev/null; then
+        echo "$p"
+        return 0
+      fi
     fi
   done
   return 1
