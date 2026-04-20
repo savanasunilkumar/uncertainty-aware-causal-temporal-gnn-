@@ -113,10 +113,14 @@ fi
 source "$VENV/bin/activate"
 python -m pip install --upgrade pip setuptools wheel >/dev/null
 
-# --- PyTorch (CPU wheel) + torch-geometric -------------------------------------
-if ! python -c 'import torch' 2>/dev/null; then
-  log "Installing torch (CPU wheel)"
-  python -m pip install --index-url https://download.pytorch.org/whl/cpu 'torch>=2.0,<2.8'
+# --- PyTorch + torchvision (CPU wheels) + torch-geometric ----------------------
+# Install torch and torchvision *together* from the CPU index so pip resolves a
+# matching pair and does not later pull in CUDA wheels from the default index
+# when torchvision is requested transitively via requirements.txt.
+if ! python -c 'import torch, torchvision' 2>/dev/null; then
+  log "Installing torch + torchvision (CPU wheels)"
+  python -m pip install --index-url https://download.pytorch.org/whl/cpu \
+    'torch>=2.0,<2.8' 'torchvision'
 fi
 if ! python -c 'import torch_geometric' 2>/dev/null; then
   log "Installing torch_geometric"
@@ -125,19 +129,25 @@ fi
 
 # --- Project requirements -------------------------------------------------------
 log "Installing project requirements"
-# Filter torch/torch-geometric out of requirements.txt so we don't clobber the
-# CPU wheel above with a CUDA one.
-grep -viE '^(torch|torch-geometric)\b' "$REPO/requirements.txt" > /tmp/uactgnn_reqs.txt
+# Filter every torch* package out of requirements.txt so pip does not clobber
+# the CPU wheels above with CUDA ones. We also drop torch-scatter/sparse/cluster
+# (they need matching CUDA builds and PyG 2.5+ has pure-Python fallbacks for
+# everything this project uses).
+grep -viE '^(torch|torch-geometric|torchvision|torch-scatter|torch-sparse|torch-cluster)\b' \
+  "$REPO/requirements.txt" > /tmp/uactgnn_reqs.txt
 python -m pip install -r /tmp/uactgnn_reqs.txt
 
 # --- Sanity: imports ------------------------------------------------------------
 log "Verifying imports"
-python - <<'PY'
+(
+  cd "$REPO"
+  python - <<'PY'
 import torch, torch_geometric, numpy, pandas, scipy, sklearn
 from causal_gnn.config import Config
 from causal_gnn.training.trainer import RecommendationSystem
 print(f"torch={torch.__version__} pyg={torch_geometric.__version__} cuda={torch.cuda.is_available()}")
 PY
+)
 
 # --- Smoke test: example_usage.py on synthetic data ----------------------------
 log "Running example_usage.py (synthetic data, CPU, ~1 min)"
