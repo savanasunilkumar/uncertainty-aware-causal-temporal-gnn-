@@ -26,9 +26,18 @@ class LearnableMultiModalFusion(nn.Module):
         )
         
     def forward(self, similarities):
+        # Cast inputs to the parameter dtype/device so callers (cold start, etc.)
+        # that build similarities from numpy / float64 intermediates do not hit a
+        # dtype mismatch against the nn.Linear weights.
+        target_dtype = self.query.dtype
+        target_device = self.query.device
+
         projected_similarities = []
         any_similarity = None
         for modality, similarity in similarities.items():
+            if not torch.is_tensor(similarity):
+                similarity = torch.as_tensor(similarity)
+            similarity = similarity.to(device=target_device, dtype=target_dtype)
             if any_similarity is None:
                 any_similarity = similarity
             if modality in self.modality_projections:
