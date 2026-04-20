@@ -30,13 +30,12 @@ warnings.filterwarnings('ignore')
 
 
 def compute_metrics(predictions_dict, test_data, k=10):
-    ground_truth = {}
-    for _, row in test_data.iterrows():
-        user_idx = int(row['user_idx'])
-        item_idx = int(row['item_idx'])
-        if user_idx not in ground_truth:
-            ground_truth[user_idx] = set()
-        ground_truth[user_idx].add(item_idx)
+    # Vectorized user -> set(items); avoids per-row iterrows().
+    ground_truth = (
+        test_data.groupby('user_idx')['item_idx']
+        .apply(lambda s: set(s.astype(int).tolist()))
+        .to_dict()
+    )
 
     precision_list = []
     recall_list = []
@@ -97,14 +96,12 @@ def benchmark_popular(train_data, test_data, num_users, num_items):
     model = PopularItems(num_users, num_items)
     model.fit(train_data)
 
-    train_user_items = {}
-    for _, row in train_data.iterrows():
-        user_idx = int(row['user_idx'])
-        item_idx = int(row['item_idx'])
-        if user_idx not in train_user_items:
-            train_user_items[user_idx] = set()
-        train_user_items[user_idx].add(item_idx)
-    
+    train_user_items = (
+        train_data.groupby('user_idx')['item_idx']
+        .apply(lambda s: set(s.astype(int).tolist()))
+        .to_dict()
+    )
+
     # Predict
     test_users = test_data['user_idx'].unique()
     predictions = model.predict_batch(test_users, top_k=10, exclude_items_dict=train_user_items)
@@ -137,13 +134,11 @@ def benchmark_bpr(train_data, test_data, num_users, num_items, device, num_epoch
     model = BPR(num_users, num_items, embedding_dim=32, learning_rate=0.01, reg_lambda=0.01)
     model.fit(train_data, num_epochs=num_epochs, batch_size=256, device=device)
 
-    train_user_items = {}
-    for _, row in train_data.iterrows():
-        user_idx = int(row['user_idx'])
-        item_idx = int(row['item_idx'])
-        if user_idx not in train_user_items:
-            train_user_items[user_idx] = set()
-        train_user_items[user_idx].add(item_idx)
+    train_user_items = (
+        train_data.groupby('user_idx')['item_idx']
+        .apply(lambda s: set(s.astype(int).tolist()))
+        .to_dict()
+    )
 
     test_users = test_data['user_idx'].unique()
     predictions = model.predict_batch(test_users, top_k=10, exclude_items_dict=train_user_items, device=device)
@@ -177,13 +172,11 @@ def benchmark_ncf(train_data, test_data, num_users, num_items, device, num_epoch
     model = NCF(num_users, num_items, embedding_dim=32, hidden_dims=[64, 32, 16], learning_rate=0.001)
     model.fit(train_data, num_epochs=num_epochs, batch_size=256, device=device)
 
-    train_user_items = {}
-    for _, row in train_data.iterrows():
-        user_idx = int(row['user_idx'])
-        item_idx = int(row['item_idx'])
-        if user_idx not in train_user_items:
-            train_user_items[user_idx] = set()
-        train_user_items[user_idx].add(item_idx)
+    train_user_items = (
+        train_data.groupby('user_idx')['item_idx']
+        .apply(lambda s: set(s.astype(int).tolist()))
+        .to_dict()
+    )
 
     test_users = test_data['user_idx'].unique()
     predictions = model.predict_batch(test_users, top_k=10, exclude_items_dict=train_user_items, device=device)
@@ -216,13 +209,11 @@ def benchmark_lightgcn(train_data, test_data, num_users, num_items, device, num_
     model = LightGCN(num_users, num_items, embedding_dim=32, num_layers=2, learning_rate=0.001, reg_lambda=1e-4)
     model.fit(train_data, num_epochs=num_epochs, batch_size=256, device=device)
 
-    train_user_items = {}
-    for _, row in train_data.iterrows():
-        user_idx = int(row['user_idx'])
-        item_idx = int(row['item_idx'])
-        if user_idx not in train_user_items:
-            train_user_items[user_idx] = set()
-        train_user_items[user_idx].add(item_idx)
+    train_user_items = (
+        train_data.groupby('user_idx')['item_idx']
+        .apply(lambda s: set(s.astype(int).tolist()))
+        .to_dict()
+    )
 
     test_users = test_data['user_idx'].unique()
     predictions = model.predict_batch(test_users, top_k=10, exclude_items_dict=train_user_items, device=device)
@@ -306,8 +297,11 @@ def benchmark_causal_gnn(train_data, val_data, test_data, num_users, num_items, 
 
         from collections import defaultdict
         rec_system.user_interactions = defaultdict(set)
-        for _, row in train_data.iterrows():
-            rec_system.user_interactions[int(row['user_idx'])].add(int(row['item_idx']))
+        rec_system.user_interactions.update(
+            train_data.groupby('user_idx')['item_idx']
+            .apply(lambda s: set(s.astype(int).tolist()))
+            .to_dict()
+        )
 
         rec_system.create_graph()
         rec_system.initialize_model()

@@ -34,13 +34,12 @@ class RecommendationDataset(Dataset):
         if user_interactions is not None:
             self.user_interactions = user_interactions
         else:
-            self.user_interactions = {}
-            for _, row in interactions.iterrows():
-                user_idx = int(row[user_col])
-                item_idx = int(row[item_col])
-                if user_idx not in self.user_interactions:
-                    self.user_interactions[user_idx] = set()
-                self.user_interactions[user_idx].add(item_idx)
+            # Vectorized user -> set(items); avoids per-row iterrows().
+            self.user_interactions = (
+                interactions.groupby(user_col)[item_col]
+                .apply(lambda s: set(s.astype(int).tolist()))
+                .to_dict()
+            )
 
         self.users = self.interactions[user_col].values.astype(np.int64)
         self.items = self.interactions[item_col].values.astype(np.int64)
@@ -136,13 +135,12 @@ def create_dataloaders(
     num_negatives: int = 1,
     pin_memory: bool = True,
 ) -> Tuple[DataLoader, Optional[DataLoader], Optional[DataLoader]]:
-    user_interactions = {}
-    for _, row in train_data.iterrows():
-        user_idx = int(row[user_col])
-        item_idx = int(row[item_col])
-        if user_idx not in user_interactions:
-            user_interactions[user_idx] = set()
-        user_interactions[user_idx].add(item_idx)
+    # Vectorized user -> set(items); avoids per-row iterrows().
+    user_interactions = (
+        train_data.groupby(user_col)[item_col]
+        .apply(lambda s: set(s.astype(int).tolist()))
+        .to_dict()
+    )
 
     if num_items is None:
         all_items = set(train_data[item_col].unique())

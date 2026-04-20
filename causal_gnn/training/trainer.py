@@ -146,9 +146,10 @@ class RecommendationSystem:
         self.data['val_data'] = val_data
         self.data['test_data'] = test_data
 
+        # Vectorized user -> set(items) mapping. Avoids per-row iterrows().
         self.user_interactions = defaultdict(set)
-        for _, row in train_data.iterrows():
-            self.user_interactions[row['user_idx']].add(row['item_idx'])
+        grouped = train_data.groupby('user_idx')['item_idx'].apply(lambda s: set(s.astype(int).tolist()))
+        self.user_interactions.update(grouped.to_dict())
 
         print(f"Data split: {len(train_data)} train, "
               f"{len(val_data) if val_data is not None else 0} validation, "
@@ -177,36 +178,78 @@ class RecommendationSystem:
         else:
             edge_timestamps = torch.arange(len(user_nodes) * 2, dtype=torch.long, device=self.device)
 
-        time_indices = torch.zeros(self.metadata['num_users'] + self.metadata['num_items'], dtype=torch.long, device=self.device)
+        # Vectorized time_indices: bucket each interaction by timestamp and
+        # take the max bucket per node (user / item+num_users). Avoids per-row
+        # iterrows() — O(E) numpy instead of O(E) Python.
+        num_nodes = self.metadata['num_users'] + self.metadata['num_items']
 
         min_time = edge_timestamps.min()
         max_time = edge_timestamps.max()
-        time_range = max_time - min_time
-        if time_range == 0:
+        time_range = (max_time - min_time).item()
+        if time_range <= 0:
             time_range = 1
-        time_step_size = time_range / self.config.time_steps
+        T = int(self.config.time_steps)
+        step = time_range / T
 
-        for idx, (_, row) in enumerate(train_data.iterrows()):
-            user_idx = int(row['user_idx'])
-            item_idx = int(row['item_idx']) + self.metadata['num_users']
+        if temporal_cols:
+            ts_np = np.asarray(timestamps, dtype=np.float64)
+        else:
+            ts_np = np.arange(len(user_nodes), dtype=np.float64)
+        buckets = np.clip(
+            ((ts_np - float(min_time)) / step).astype(np.int64),
+            0,
+            T - 1,
+        )
 
-            if temporal_cols:
-                timestamp = timestamps[idx]
-            else:
-                timestamp = idx
-
-            time_step = int((timestamp - min_time) / time_step_size)
-            time_step = min(time_step, self.config.time_steps - 1)
-
-            time_indices[user_idx] = max(time_indices[user_idx], time_step)
-            time_indices[item_idx] = max(time_indices[item_idx], time_step)
+        time_indices_np = np.zeros(num_nodes, dtype=np.int64)
+        np.maximum.at(time_indices_np, train_data['user_idx'].values.astype(np.int64), buckets)
+        np.maximum.at(
+            time_indices_np,
+            train_data['item_idx'].values.astype(np.int64) + self.metadata['num_users'],
+            buckets,
+        )
+        time_indices = torch.from_numpy(time_indices_np).to(self.device)
 
         self.edge_index = edge_index
         self.edge_timestamps = edge_timestamps
         self.time_indices = time_indices
 
         print(f"Created temporal graph with {self.edge_index.size(1)} edges")
+        self._precompute_causal_graph()
         return self.edge_index, self.edge_timestamps, self.time_indices
+
+    def _precompute_causal_graph(self):
+        """Build the (co-activity) causal edge set once, up-front.
+
+        The forward pass previously reconstructed this on every batch, with a
+        CPU round-trip for the Granger computation. Precomputing once here
+        keeps the training loop on-GPU.
+        """
+        if getattr(self.config, 'causal_method', 'advanced') == 'simple':
+            self._cached_causal_edge_index = self.edge_index
+            self._cached_causal_edge_weights = torch.ones(
+                self.edge_index.size(1), dtype=torch.float, device=self.device
+            )
+            return
+
+        from ..causal.discovery import CausalGraphConstructor
+        constructor = CausalGraphConstructor(self.config)
+        edges, weights = constructor.compute_hybrid_causal_graph(
+            self.edge_index.detach().cpu().numpy(),
+            np.zeros((1, 1), dtype=np.float32),  # node_features no longer used
+            self.edge_timestamps.detach().cpu().numpy(),
+        )
+        if edges:
+            ci = torch.tensor(edges, dtype=torch.long, device=self.device).t().contiguous()
+            cw = torch.tensor(weights, dtype=torch.float, device=self.device)
+        else:
+            ci = self.edge_index
+            cw = torch.ones(self.edge_index.size(1), dtype=torch.float, device=self.device)
+        self._cached_causal_edge_index = ci
+        self._cached_causal_edge_weights = cw
+        self.logger.info(
+            f"Precomputed co-activity graph: {ci.size(1)} edges (from {self.edge_index.size(1)} interactions)."
+        )
     
     def initialize_model(self):
         self.model = CausalTemporalGNN(
@@ -216,6 +259,13 @@ class RecommendationSystem:
         self.model.edge_index = self.edge_index
         self.model.edge_timestamps = self.edge_timestamps
         self.model.time_indices = self.time_indices
+
+        # Install the precomputed co-activity graph so forward() never rebuilds it.
+        if hasattr(self, '_cached_causal_edge_index'):
+            self.model.set_causal_graph(
+                self._cached_causal_edge_index,
+                self._cached_causal_edge_weights,
+            )
 
         if getattr(self.config, 'use_hard_negatives', False):
             from ..data.samplers import MixedNegativeSampler

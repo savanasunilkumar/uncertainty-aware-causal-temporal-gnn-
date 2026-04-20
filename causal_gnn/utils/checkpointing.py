@@ -104,7 +104,10 @@ class ModelCheckpointer:
         if not os.path.exists(checkpoint_path):
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
         
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+        # weights_only=False: our checkpoints contain python dicts with
+        # numpy scalars (metrics). Safe here because checkpoints are written
+        # by this same process.
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         
         model.load_state_dict(checkpoint['model_state_dict'])
         
