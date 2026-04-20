@@ -59,7 +59,36 @@ if [[ -z "${PY:-}" ]]; then
     PY="$(find_python || true)"
   fi
 fi
-[[ -n "${PY:-}" ]] || die "Could not find Python 3.9+. Run 'module avail python' and 'module load <version>' yourself, then re-run this script."
+
+# Fallback 1: reuse an already-installed Miniconda in the user's home.
+if [[ -z "${PY:-}" && -x "$HOME/miniconda3/bin/python" ]]; then
+  log "Activating existing Miniconda at $HOME/miniconda3"
+  # shellcheck disable=SC1091
+  source "$HOME/miniconda3/bin/activate"
+  PY="$(find_python || true)"
+fi
+
+# Fallback 2: auto-install Miniconda into $HOME/miniconda3 (no sudo).
+# Skip with UACTGNN_NO_MINICONDA=1.
+if [[ -z "${PY:-}" && -z "${UACTGNN_NO_MINICONDA:-}" ]]; then
+  log "No system Python 3.9+; installing Miniconda into \$HOME/miniconda3"
+  MC_URL="${MINICONDA_URL:-https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh}"
+  MC_SH="$(mktemp --suffix=.sh)"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$MC_URL" -o "$MC_SH"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q "$MC_URL" -O "$MC_SH"
+  else
+    die "Neither curl nor wget available; cannot install Miniconda."
+  fi
+  bash "$MC_SH" -b -p "$HOME/miniconda3"
+  rm -f "$MC_SH"
+  # shellcheck disable=SC1091
+  source "$HOME/miniconda3/bin/activate"
+  PY="$(find_python || true)"
+fi
+
+[[ -n "${PY:-}" ]] || die "Could not find Python 3.9+. Either install one, 'module load <python>', or re-run without UACTGNN_NO_MINICONDA to auto-install Miniconda."
 log "Using Python: $PY ($($PY -V))"
 
 # --- Workspace + clone ----------------------------------------------------------
