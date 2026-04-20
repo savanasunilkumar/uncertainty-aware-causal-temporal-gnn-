@@ -22,11 +22,26 @@ class Config:
         self.dropout = kwargs.get('dropout', 0.2)
         self.causal_strength = kwargs.get('causal_strength', 0.5)
         
-        # Causal Discovery
-        self.causal_method = kwargs.get('causal_method', 'advanced')  # 'simple', 'advanced', 'bayesian'
+        # Causal (temporal co-activity) Discovery.
+        # Despite the name, the resulting edges are a co-activity proxy, not
+        # counterfactual causal structure. See causal_gnn/causal/discovery.py.
+        #   'simple'   -> identity (just the interaction edges, unit weights)
+        #   'advanced' -> vectorized pairwise Granger F-test
+        #   'pc'       -> constraint-based PC (requires `causal-learn`)
+        #   'bayesian' -> Bayesian edge-strength variant in bayesian_discovery.py
+        self.causal_method = kwargs.get('causal_method', 'advanced')
         self.significance_level = kwargs.get('significance_level', 0.05)
         self.max_lag = kwargs.get('max_lag', 5)
         self.min_causal_strength = kwargs.get('min_causal_strength', 0.1)
+        # Cap on the number of nodes included in the Granger solve.
+        # Nodes with the highest activity are kept; others get 0 edges.
+        self.max_causal_nodes = kwargs.get('max_causal_nodes', 512)
+
+        # Cold-start optional-dependency gates. If set to True and the
+        # corresponding backend (transformers / torchvision+Pillow) is not
+        # installed, ColdStartSolver.load_pretrained_models raises.
+        self.cold_start_require_text = kwargs.get('cold_start_require_text', False)
+        self.cold_start_require_vision = kwargs.get('cold_start_require_vision', False)
 
         self.use_uncertainty = kwargs.get('use_uncertainty', False)
         self.mc_dropout_samples = kwargs.get('mc_dropout_samples', 10)
@@ -72,11 +87,19 @@ class Config:
         self.device = kwargs.get('device', 'cuda' if torch.cuda.is_available() else 'cpu')
         self.seed = kwargs.get('seed', 42)
         
-        # Distributed Training Configuration
+        # Distributed Training Configuration.
+        # NOTE: These flags are currently UNUSED. The training loop does not
+        # wrap the model in DistributedDataParallel; they are preserved only
+        # as placeholders. Setting them to non-default values has no effect.
         self.distributed = kwargs.get('distributed', False)
         self.world_size = kwargs.get('world_size', 1)
         self.rank = kwargs.get('rank', 0)
         self.local_rank = kwargs.get('local_rank', 0)
+
+        # Neighbor-sampling pool size. NOTE: neighbor sampling is NOT wired
+        # into the training loop; the forward pass always runs on the full
+        # graph. This flag is preserved only as a placeholder.
+        self.neighbor_sampling_pool_size = kwargs.get('neighbor_sampling_pool_size', 0)
         
         # Mixed Precision Training
         self.use_amp = kwargs.get('use_amp', False)
@@ -102,12 +125,14 @@ class Config:
         self.causal_graph_cache_dir = kwargs.get('causal_graph_cache_dir', './cache/causal_graphs')
         self.use_cached_causal_graph = kwargs.get('use_cached_causal_graph', True)
         
+        # NOTE: neighbor sampling is not wired into the training loop.
+        # These flags are placeholders only.
         self.use_neighbor_sampling = kwargs.get('use_neighbor_sampling', False)
         self.num_neighbors = kwargs.get('num_neighbors', [10, 5])
-        
+
         # Sparse Tensor Support
         self.use_sparse_tensors = kwargs.get('use_sparse_tensors', True)
-        
+
         # Create necessary directories
         os.makedirs(self.data_dir, exist_ok=True)
         os.makedirs(self.output_dir, exist_ok=True)
@@ -115,9 +140,43 @@ class Config:
         os.makedirs(self.log_dir, exist_ok=True)
         if self.precompute_causal_graph:
             os.makedirs(self.causal_graph_cache_dir, exist_ok=True)
-        
+
         # Set random seeds for reproducibility
         self._set_seed()
+        self.validate()
+
+    def validate(self):
+        """Fail fast on configurations that depend on missing optional deps.
+
+        This replaces silent zero-output fallbacks for missing `causal-learn`
+        / `transformers` with a clear ImportError at config time.
+        """
+        if self.causal_method not in {'simple', 'advanced', 'pc', 'bayesian'}:
+            raise ValueError(
+                f"Unknown causal_method={self.causal_method!r}. "
+                "Expected one of: 'simple', 'advanced', 'pc', 'bayesian'."
+            )
+        if self.causal_method == 'pc':
+            try:
+                import causallearn  # noqa: F401
+            except ImportError as e:
+                raise ImportError(
+                    "causal_method='pc' requires the `causal-learn` package. "
+                    "Install with `pip install causal-learn`, or use "
+                    "causal_method='advanced' (Granger) / 'simple' (identity)."
+                ) from e
+        if self.distributed:
+            raise NotImplementedError(
+                "config.distributed=True is not supported: the training loop "
+                "does not wrap the model in DistributedDataParallel in this "
+                "version. Leave `distributed=False`."
+            )
+        if self.use_neighbor_sampling:
+            raise NotImplementedError(
+                "config.use_neighbor_sampling=True is not supported: the "
+                "training loop runs full-graph forward passes. Set it to "
+                "False."
+            )
     
     def _set_seed(self):
         """Set random seeds for reproducibility."""

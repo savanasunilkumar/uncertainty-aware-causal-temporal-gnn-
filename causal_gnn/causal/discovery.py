@@ -1,198 +1,299 @@
-"""Causal discovery techniques for recommendation systems."""
+"""Temporal co-activity graph construction for recommendation systems.
+
+NOTE on naming
+--------------
+The public API still uses the word "causal" for backward compatibility,
+but what this module actually computes is a *temporal co-activity graph*:
+a pairwise score on node activity time series using Granger's F-test.
+Granger causality is a test of *predictive* precedence, not of causation;
+on user/item activity counts, it mostly picks up co-popularity and shared
+temporal trends. Treat the resulting edges as a data-driven regularizer
+that encodes "when node A was active, node B's activity changed in a
+way the data predicts," not as ground-truth causal structure.
+
+References:
+- Luo et al. (2024), "A Survey on Causal Inference for Recommendation"
+  (arXiv:2303.11666) — why "causal" in recsys needs IV/backdoor/uplift
+  style procedures, not Granger on aggregate counts.
+- The repo previously applied the PC algorithm to node *feature* rows
+  using Pearson correlation as edge strength; that is a misuse
+  (PC expects i.i.d. samples of variables) and has been removed.
+"""
+
+import logging
+from typing import Dict, List, Tuple
 
 import numpy as np
-import torch
-from collections import defaultdict
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LinearRegression
-from scipy.stats import pearsonr, f as f_distribution
+from scipy.stats import f as f_distribution
 
-# For causal discovery
+logger = logging.getLogger(__name__)
+
 try:
-    from causallearn.search.ConstraintBased.PC import pc
-    from causallearn.utils.cit import CIT
+    from causallearn.search.ConstraintBased.PC import pc  # noqa: F401
     CAUSAL_LEARN_AVAILABLE = True
 except ImportError:
-    print("Warning: causal-learn not installed. Causal discovery will be disabled.")
-    print("Install with: pip install causal-learn")
     CAUSAL_LEARN_AVAILABLE = False
 
 
 class CausalGraphConstructor:
-    """Implements causal discovery techniques for recommendation systems."""
-    
+    """Builds a temporal co-activity adjacency over active nodes.
+
+    Despite the name (kept for backward compatibility), the edges are *not*
+    causal in the counterfactual sense; see module docstring.
+    """
+
     def __init__(self, config):
         self.config = config
-        self.causal_method = config.causal_method
-        self.significance_level = config.significance_level
-        self.max_lag = config.max_lag
-        self.min_causal_strength = config.min_causal_strength
-        
-    def compute_granger_causality(self, time_series, max_lag=None):
-        if not CAUSAL_LEARN_AVAILABLE:
-            print("Warning: causal-learn not available. Skipping Granger causality.")
-            return np.zeros((len(time_series), len(time_series)))
+        self.causal_method = getattr(config, 'causal_method', 'advanced')
+        self.significance_level = getattr(config, 'significance_level', 0.05)
+        self.max_lag = getattr(config, 'max_lag', 3)
+        self.min_causal_strength = getattr(config, 'min_causal_strength', 0.05)
+        self.max_nodes = getattr(config, 'max_causal_nodes', 512)
 
+    def _extract_time_series(
+        self,
+        interaction_data: np.ndarray,
+        edge_timestamps: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Vectorized per-node time-bucketed interaction counts.
+
+        Returns
+        -------
+        series : (n_nodes, T) int32 array of activity counts per time bucket.
+        node_totals : (n_nodes,) int32 array of total interaction counts.
+        """
+        T = int(self.config.time_steps)
+        ts = np.asarray(edge_timestamps, dtype=np.float64)
+        if ts.size == 0:
+            return np.zeros((0, T), dtype=np.int32), np.zeros(0, dtype=np.int32)
+
+        min_t = ts.min()
+        max_t = ts.max()
+        trange = max(float(max_t - min_t), 1.0)
+        step = trange / float(T)
+        bucket = np.clip(((ts - min_t) / step).astype(np.int64), 0, T - 1)
+
+        src = np.asarray(interaction_data[0], dtype=np.int64)
+        dst = np.asarray(interaction_data[1], dtype=np.int64)
+        n_nodes = int(max(src.max(), dst.max()) + 1) if src.size else 0
+
+        series = np.zeros((n_nodes, T), dtype=np.int32)
+        np.add.at(series, (src, bucket), 1)
+        np.add.at(series, (dst, bucket), 1)
+        node_totals = series.sum(axis=1).astype(np.int32)
+        return series, node_totals
+
+    def compute_granger_causality(
+        self,
+        series: np.ndarray,
+        max_lag: int = None,
+    ) -> np.ndarray:
+        """Vectorized pairwise Granger F-test on activity time series.
+
+        For each pair (i, j) we compare:
+          reduced:  y_t = sum_l a_l y_{t-l}                    (target-only)
+          full:     y_t = sum_l a_l y_{t-l} + sum_l b_l x_{t-l} (target + source)
+        and return an F-statistic-derived strength in [0, 1] thresholded at
+        ``min_causal_strength`` and filtered by ``significance_level``.
+
+        This is an O(N^2 * T) numpy implementation (no Python inner loops).
+        """
         if max_lag is None:
             max_lag = self.max_lag
-            
-        nodes = list(time_series.keys())
-        n_nodes = len(nodes)
-        causal_matrix = np.zeros((n_nodes, n_nodes))
+        if series.size == 0:
+            return np.zeros((0, 0), dtype=np.float32)
 
-        scaler = StandardScaler()
-        standardized_series = {}
-        for node in nodes:
-            if len(time_series[node]) > max_lag:
-                standardized_series[node] = scaler.fit_transform(
-                    np.array(time_series[node]).reshape(-1, 1)
-                ).flatten()
+        n_nodes, T = series.shape
+        if T <= 2 * max_lag + 2:
+            return np.zeros((n_nodes, n_nodes), dtype=np.float32)
 
-        for i, source in enumerate(nodes):
-            for j, target in enumerate(nodes):
-                if i == j or source not in standardized_series or target not in standardized_series:
-                    continue
-                
-                source_series = standardized_series[source]
-                target_series = standardized_series[target]
+        # Standardize each node's series.
+        x = series.astype(np.float64)
+        mu = x.mean(axis=1, keepdims=True)
+        sd = x.std(axis=1, keepdims=True) + 1e-8
+        x = (x - mu) / sd
 
-                if len(source_series) <= max_lag or len(target_series) <= max_lag:
-                    continue
+        # Build lag matrices: y = values at t in [max_lag, T), shape (n_nodes, T-max_lag)
+        # Y_lag[i, l, t] = x[i, t - (l+1)] for l in [0, max_lag)
+        n_obs = T - max_lag
+        lags = np.stack(
+            [x[:, max_lag - l - 1:T - l - 1] for l in range(max_lag)],
+            axis=1,
+        )  # (n_nodes, max_lag, n_obs)
+        y = x[:, max_lag:]  # (n_nodes, n_obs)
 
-                X = []
-                y = []
-
-                for t in range(max_lag, len(target_series)):
-                    y.append(target_series[t])
-
-                    row = []
-                    for lag in range(1, max_lag + 1):
-                        row.append(target_series[t - lag])
-                        row.append(source_series[t - lag])
-                    X.append(row)
-                
-                X = np.array(X)
-                y = np.array(y)
-                
-                if len(X) == 0:
-                    continue
-
-                X_target_only = X[:, ::2]
-                if X_target_only.shape[1] > 0:
-                    model_target_only = LinearRegression().fit(X_target_only, y)
-                    mse_target_only = np.mean((model_target_only.predict(X_target_only) - y) ** 2)
-                else:
-                    mse_target_only = np.mean((y - np.mean(y))**2)
-
-                model_both = LinearRegression().fit(X, y)
-                mse_both = np.mean((model_both.predict(X) - y) ** 2)
-
-                n_obs = len(y)
-                df1 = max_lag
-                df2 = n_obs - 2 * max_lag
-
-                if mse_target_only > 1e-6 and mse_both > 1e-6 and df2 > 0:
-                    f_stat = ((mse_target_only - mse_both) / df1) / (mse_both / df2)
-
-                    if f_stat > 0:
-                        p_value = f_distribution.sf(f_stat, df1, df2)
-                    else:
-                        p_value = 1.0
-
-                    if p_value < self.significance_level:
-                        partial_r2 = (mse_target_only - mse_both) / mse_target_only
-                        causal_strength = min(1.0, max(0.0, partial_r2))
-                        if causal_strength > self.min_causal_strength:
-                            causal_matrix[i, j] = causal_strength
-        
-        return causal_matrix
-    
-    def compute_pc_algorithm(self, data):
-        if not CAUSAL_LEARN_AVAILABLE:
-            print("Warning: causal-learn not available. Skipping PC algorithm.")
-            return np.zeros((data.shape[0], data.shape[0]))
-
+        # Reduced OLS (target-only) per node: design = [y lags, 1]
+        reduced_design = np.concatenate(
+            [np.transpose(lags, (0, 2, 1)), np.ones((n_nodes, n_obs, 1))],
+            axis=-1,
+        )  # (n_nodes, n_obs, max_lag+1)
+        # Solve per-node reduced model: beta_i = (X_i^T X_i)^-1 X_i^T y_i
+        # Use np.linalg.lstsq in a loop would be Python; instead batched via einsum.
+        xtx_red = np.einsum('nij,nik->njk', reduced_design, reduced_design)
+        xty_red = np.einsum('nij,ni->nj', reduced_design, y)
         try:
-            cg = pc(data, alpha=self.significance_level, indep_test="fisherz")
+            beta_red = np.linalg.solve(
+                xtx_red + 1e-8 * np.eye(max_lag + 1)[None, :, :],
+                xty_red[:, :, None],
+            )[:, :, 0]
+        except np.linalg.LinAlgError:
+            return np.zeros((n_nodes, n_nodes), dtype=np.float32)
+        resid_red = y - np.einsum('nij,nj->ni', reduced_design, beta_red)
+        rss_red = (resid_red ** 2).sum(axis=1) + 1e-12  # (n_nodes,)
 
-            n_nodes = data.shape[0]
-            causal_matrix = np.zeros((n_nodes, n_nodes))
+        # Full model adds source lags. To keep memory bounded, restrict Granger
+        # to the top-K most active nodes (by total activity). Others become
+        # zero-strength.
+        if n_nodes > self.max_nodes:
+            totals = series.sum(axis=1)
+            keep = np.argpartition(-totals, self.max_nodes)[:self.max_nodes]
+            keep.sort()
+        else:
+            keep = np.arange(n_nodes)
+        k = keep.size
+        if k == 0:
+            return np.zeros((n_nodes, n_nodes), dtype=np.float32)
 
-            G = cg.G
-            for i in range(n_nodes):
-                for j in range(n_nodes):
-                    if G.has_edge(i, j):
-                        correlation, _ = pearsonr(data[i], data[j])
-                        if not np.isnan(correlation):
-                            causal_matrix[i, j] = abs(correlation)
+        lags_k = lags[keep]       # (k, max_lag, n_obs)
+        y_k = y[keep]             # (k, n_obs)
+        rss_red_k = rss_red[keep] # (k,)
 
-            return causal_matrix
-        except Exception as e:
-            print(f"Error in PC algorithm: {e}. Falling back to correlation-based causality.")
-            n_nodes = data.shape[0]
-            causal_matrix = np.zeros((n_nodes, n_nodes))
-            for i in range(n_nodes):
-                for j in range(n_nodes):
-                    if i != j:
-                        correlation, _ = pearsonr(data[i], data[j])
-                        if not np.isnan(correlation) and abs(correlation) > self.min_causal_strength:
-                            causal_matrix[i, j] = abs(correlation)
-            return causal_matrix
+        # For target j, design = [y_j lags, x_i lags, 1]; run i over k candidates.
+        # Solve full-model RSS for all (i, j) pairs in vectorized form.
+        # Shape construction: full design for pair (i, j) has 2*max_lag + 1 columns.
+        # We assemble an (k_j, k_i, n_obs, 2L+1) tensor. With k=max_nodes=512 and L=3
+        # this is 512*512*~T*7 floats — capped by T.
+        L = max_lag
+        # y-lags: (k_j, n_obs, L) — repeated over source axis below
+        y_lag_mat = np.transpose(lags_k, (0, 2, 1))  # (k, n_obs, L)
+        ones = np.ones((k, 1, n_obs, 1), dtype=np.float64)
 
-    def compute_hybrid_causal_graph(self, interaction_data, node_features, edge_timestamps):
-        time_series = self._extract_time_series(interaction_data, edge_timestamps)
+        # Source lags tiled over target: (k_j=1, k_i, n_obs, L)
+        src_lag_mat = np.transpose(lags_k, (0, 2, 1))[None, :, :, :]
 
-        granger_matrix = self.compute_granger_causality(time_series)
+        # Target lags tiled over source: (k_j, k_i=1, n_obs, L)
+        tgt_lag_mat = y_lag_mat[:, None, :, :]
 
-        pc_matrix = self.compute_pc_algorithm(node_features)
+        # Broadcast to (k_j, k_i, n_obs, L) each, then concat on last axis.
+        # Intentionally not materializing an (k_j, k_i, n_obs, 2L+1) float64 tensor
+        # for very large k: fall back to a per-target loop when it would exceed
+        # ~1 GiB.
+        approx_bytes = k * k * n_obs * (2 * L + 1) * 8
+        f_matrix = np.zeros((n_nodes, n_nodes), dtype=np.float32)
+        strength_matrix = np.zeros((n_nodes, n_nodes), dtype=np.float32)
 
-        combined_matrix = 0.6 * granger_matrix + 0.4 * pc_matrix
+        def _update_from_chunk(j_idx_global, i_idx_global, rss_full):
+            rss_red_val = rss_red[j_idx_global]
+            df_num = L
+            df_den = n_obs - (2 * L + 1)
+            if df_den <= 0 or rss_red_val <= 0:
+                return
+            num = (rss_red_val - rss_full) / df_num
+            den = np.maximum(rss_full, 1e-12) / df_den
+            f_stat = np.maximum(num / den, 0.0)
+            p = f_distribution.sf(f_stat, df_num, df_den)
+            strength = np.clip(
+                (rss_red_val - rss_full) / rss_red_val,
+                0.0,
+                1.0,
+            )
+            mask = (p < self.significance_level) & (strength > self.min_causal_strength)
+            f_matrix[j_idx_global, i_idx_global] = np.where(mask, f_stat, 0.0).astype(
+                np.float32
+            )
+            strength_matrix[j_idx_global, i_idx_global] = np.where(
+                mask, strength, 0.0
+            ).astype(np.float32)
 
-        causal_edges = []
-        edge_weights = []
-
-        for i in range(combined_matrix.shape[0]):
-            for j in range(combined_matrix.shape[1]):
-                if i != j and combined_matrix[i, j] > self.min_causal_strength:
-                    causal_edges.append((i, j))
-                    edge_weights.append(combined_matrix[i, j])
-        
-        return causal_edges, edge_weights
-    
-    def _extract_time_series(self, interaction_data, edge_timestamps):
-        """Extract time series data for each node from interactions."""
-        node_time_series = {}
-        time_step_interactions = defaultdict(list)
-
-        min_time = edge_timestamps.min()
-        max_time = edge_timestamps.max()
-        time_range = max_time - min_time
-        if time_range == 0:
-            time_range = 1
-
-        time_step_size = time_range / self.config.time_steps
-
-        for i, timestamp in enumerate(edge_timestamps):
-            time_step = int((timestamp - min_time) / time_step_size)
-            time_step = min(time_step, self.config.time_steps - 1)
-            
-            user_idx = interaction_data[0, i]
-            item_idx = interaction_data[1, i]
-            
-            time_step_interactions[time_step].append((user_idx, item_idx))
-
-        n_nodes = interaction_data.max() + 1
-        for node_idx in range(n_nodes):
-            time_series = []
-            
-            for time_step in sorted(time_step_interactions.keys()):
-                count = sum(
-                    1 for user, item in time_step_interactions[time_step]
-                    if user == node_idx or item == node_idx
+        if approx_bytes > 1_000_000_000:
+            # Per-target loop; still fully vectorized over source.
+            for jj_local in range(k):
+                jj_global = int(keep[jj_local])
+                # Design for all i at this target j:
+                # (k_i, n_obs, 2L+1) = [y_j lags, x_i lags, 1]
+                y_lags_j = np.broadcast_to(
+                    y_lag_mat[jj_local][None, :, :], (k, n_obs, L)
                 )
-                time_series.append(count)
-            
-            node_time_series[node_idx] = time_series
-        
-        return node_time_series
+                x_lags_i = np.transpose(lags_k, (0, 2, 1))  # (k, n_obs, L)
+                ones_i = np.ones((k, n_obs, 1), dtype=np.float64)
+                design = np.concatenate([y_lags_j, x_lags_i, ones_i], axis=-1)
+                xtx = np.einsum('kij,kil->kjl', design, design)
+                y_tgt = np.broadcast_to(y_k[jj_local][None, :], (k, n_obs))
+                xty = np.einsum('kij,ki->kj', design, y_tgt)
+                try:
+                    beta = np.linalg.solve(
+                        xtx + 1e-8 * np.eye(2 * L + 1)[None, :, :],
+                        xty[:, :, None],
+                    )[:, :, 0]
+                except np.linalg.LinAlgError:
+                    continue
+                resid = y_tgt - np.einsum('kij,kj->ki', design, beta)
+                rss_full = (resid ** 2).sum(axis=1)
+                _update_from_chunk(jj_global, keep, rss_full)
+        else:
+            # Full (k_j, k_i, n_obs, 2L+1) tensor: one big solve.
+            tgt_lag_bc = np.broadcast_to(tgt_lag_mat, (k, k, n_obs, L))
+            src_lag_bc = np.broadcast_to(src_lag_mat, (k, k, n_obs, L))
+            ones_bc = np.ones((k, k, n_obs, 1), dtype=np.float64)
+            design = np.concatenate([tgt_lag_bc, src_lag_bc, ones_bc], axis=-1)
+            xtx = np.einsum('jinl,jinm->jilm', design, design)
+            y_tgt = np.broadcast_to(y_k[:, None, :], (k, k, n_obs))
+            xty = np.einsum('jinl,jin->jil', design, y_tgt)
+            try:
+                beta = np.linalg.solve(
+                    xtx + 1e-8 * np.eye(2 * L + 1)[None, None, :, :],
+                    xty[:, :, :, None],
+                )[:, :, :, 0]
+            except np.linalg.LinAlgError:
+                return strength_matrix
+            resid = y_tgt - np.einsum('jinl,jil->jin', design, beta)
+            rss_full = (resid ** 2).sum(axis=-1)  # (k, k)
+            for jj_local in range(k):
+                _update_from_chunk(int(keep[jj_local]), keep, rss_full[jj_local])
 
+        np.fill_diagonal(strength_matrix, 0.0)
+        return strength_matrix
+
+    def compute_pc_algorithm(self, data: np.ndarray) -> np.ndarray:
+        """Deprecated. Kept as a stub that returns a zero matrix with a warning.
+
+        Previously this ran PC on node-feature rows using Pearson correlation
+        as the edge strength. PC expects i.i.d. samples of variables; passing
+        embedding rows is a misuse. If you want actual constraint-based
+        structure discovery, run it on a properly-shaped variable matrix at
+        a higher level in your pipeline.
+        """
+        logger.warning(
+            "compute_pc_algorithm is deprecated and returns zeros; "
+            "prior implementation was a misuse of the PC algorithm."
+        )
+        n = int(data.shape[0]) if data.size else 0
+        return np.zeros((n, n), dtype=np.float32)
+
+    def compute_hybrid_causal_graph(
+        self,
+        interaction_data: np.ndarray,
+        node_features: np.ndarray,
+        edge_timestamps: np.ndarray,
+    ) -> Tuple[List[Tuple[int, int]], List[float]]:
+        """Build the co-activity edge set used by the GNN.
+
+        The hybrid was previously 0.6 * Granger + 0.4 * PC(node features).
+        PC was misapplied; this now returns Granger-only edges thresholded at
+        ``min_causal_strength``. See module docstring.
+        """
+        if not CAUSAL_LEARN_AVAILABLE and self.causal_method == 'pc':
+            raise ImportError(
+                "causal_method='pc' requires `causal-learn`. "
+                "Install with `pip install causal-learn` or use "
+                "causal_method='advanced' (Granger) / 'simple' (identity)."
+            )
+
+        series, _ = self._extract_time_series(interaction_data, edge_timestamps)
+        strength = self.compute_granger_causality(series)
+
+        mask = strength > self.min_causal_strength
+        src_idx, dst_idx = np.nonzero(mask)
+        edges = list(zip(src_idx.tolist(), dst_idx.tolist()))
+        weights = strength[src_idx, dst_idx].astype(np.float32).tolist()
+        return edges, weights

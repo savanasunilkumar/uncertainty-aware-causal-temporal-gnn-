@@ -50,13 +50,12 @@ class BPR(nn.Module):
         self.to(device)
         self.train()
 
-        user_items = {}
-        for _, row in train_data.iterrows():
-            user_idx = int(row['user_idx'])
-            item_idx = int(row['item_idx'])
-            if user_idx not in user_items:
-                user_items[user_idx] = []
-            user_items[user_idx].append(item_idx)
+        # Vectorized user -> list(items) via groupby; avoids per-row iterrows().
+        user_items = (
+            train_data.groupby('user_idx')['item_idx']
+            .apply(lambda s: s.astype(int).tolist())
+            .to_dict()
+        )
 
         all_items = set(range(self.num_items))
 

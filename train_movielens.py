@@ -161,7 +161,9 @@ def get_optimal_config(dataset='ml-100k', use_uncertainty=False):
         base_config['num_epochs'] = 30
         base_config['embedding_dim'] = 128
         base_config['use_gradient_checkpointing'] = True
-        base_config['use_neighbor_sampling'] = True
+        # Neighbor sampling is not wired into the training loop yet; leaving
+        # it False avoids Config.validate() raising.
+        base_config['use_neighbor_sampling'] = False
 
     if use_uncertainty:
         base_config.update({

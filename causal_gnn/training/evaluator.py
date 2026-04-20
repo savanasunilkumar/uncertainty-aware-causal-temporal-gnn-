@@ -20,9 +20,12 @@ class Evaluator:
             'hit_ratio': {k: 0.0 for k in k_values}
         }
 
+        # Vectorized user -> list(items). Avoids per-row iterrows().
         user_test_items = defaultdict(list)
-        for _, row in eval_data.iterrows():
-            user_test_items[row['user_idx']].append(row['item_idx'])
+        grouped = eval_data.groupby('user_idx')['item_idx'].apply(
+            lambda s: s.astype(int).tolist()
+        )
+        user_test_items.update(grouped.to_dict())
 
         test_users = list(user_test_items.keys())
         n_batches = (len(test_users) + batch_size - 1) // batch_size

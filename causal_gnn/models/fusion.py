@@ -27,13 +27,20 @@ class LearnableMultiModalFusion(nn.Module):
         
     def forward(self, similarities):
         projected_similarities = []
+        any_similarity = None
         for modality, similarity in similarities.items():
+            if any_similarity is None:
+                any_similarity = similarity
             if modality in self.modality_projections:
                 projected = self.modality_projections[modality](similarity.unsqueeze(-1))
                 projected_similarities.append(projected)
-        
+
         if not projected_similarities:
-            return torch.tensor(0.0)
+            # Preserve autograd + device/dtype of the inputs if any were passed,
+            # otherwise fall back to a zero tied to the fusion parameters.
+            if any_similarity is not None:
+                return torch.zeros_like(any_similarity)
+            return self.query.sum() * 0.0
 
         stacked_similarities = torch.stack(projected_similarities, dim=1)
 

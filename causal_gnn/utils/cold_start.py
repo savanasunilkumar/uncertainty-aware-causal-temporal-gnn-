@@ -7,23 +7,23 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 from ..models.fusion import LearnableMultiModalFusion
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 try:
     from transformers import AutoModel, AutoTokenizer
     TRANSFORMERS_AVAILABLE = True
 except ImportError:
-    print("Warning: transformers not installed. Zero-shot text features will be disabled.")
-    print("Install with: pip install transformers")
     TRANSFORMERS_AVAILABLE = False
 
 try:
-    import cv2
+    import cv2  # noqa: F401
     from PIL import Image
     import torchvision.models as models
     import torchvision.transforms as transforms
     VISION_AVAILABLE = True
 except ImportError:
-    print("Warning: OpenCV or Pillow not installed. Image features will be disabled.")
-    print("Install with: pip install opencv-python Pillow")
     VISION_AVAILABLE = False
 
 
@@ -38,12 +38,33 @@ class ColdStartSolver:
         self.fusion_model = None
 
     def load_pretrained_models(self):
-        if TRANSFORMERS_AVAILABLE:
+        require_text = getattr(self.config, 'cold_start_require_text', True)
+        require_vision = getattr(self.config, 'cold_start_require_vision', False)
+
+        if not TRANSFORMERS_AVAILABLE:
+            msg = (
+                "ColdStartSolver.load_pretrained_models: `transformers` is not "
+                "installed. Install with `pip install transformers` or set "
+                "`config.cold_start_require_text=False` to run without text features."
+            )
+            if require_text:
+                raise ImportError(msg)
+            logger.warning(msg)
+        else:
             print("Loading DistilBERT for text features...")
             self.pretrained_models['text'] = AutoModel.from_pretrained('distilbert-base-uncased')
             self.pretrained_models['text_tokenizer'] = AutoTokenizer.from_pretrained('distilbert-base-uncased')
-        
-        if VISION_AVAILABLE:
+
+        if not VISION_AVAILABLE:
+            msg = (
+                "ColdStartSolver.load_pretrained_models: torchvision / Pillow / OpenCV "
+                "are not installed. Install with `pip install opencv-python Pillow` "
+                "or set `config.cold_start_require_vision=False` to run without image features."
+            )
+            if require_vision:
+                raise ImportError(msg)
+            logger.warning(msg)
+        elif VISION_AVAILABLE:
             print("Loading ResNet18 for image features...")
             try:
                 self.pretrained_models['vision'] = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
