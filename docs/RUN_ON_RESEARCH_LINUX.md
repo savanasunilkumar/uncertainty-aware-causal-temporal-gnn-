@@ -51,19 +51,22 @@ What this does (idempotent, ~5–10 min first run, under a minute on reruns):
 
 1. Creates `~/uactgnn/` as workspace (override with `UACTGNN_HOME=...`).
 2. Clones the repo into `~/uactgnn/uncertainty-aware-causal-temporal-gnn-`.
-3. Finds a Python 3.9–3.12; if nothing is on `PATH`, tries `module load python/…`.
+3. Finds a Python 3.9–3.12. Fallback order:
+   1. `python3.12` … `python3.9` / `python3` on `PATH`.
+   2. `module load python/…` (if the host has an Environment Modules / Lmod system).
+   3. Activate an existing `$HOME/miniconda3`.
+   4. Auto-install Miniconda into `$HOME/miniconda3` (no sudo). Skip with `UACTGNN_NO_MINICONDA=1`.
 4. Builds a venv at `~/uactgnn/.venv`.
 5. Installs CPU-only `torch`, `torch-geometric`, and the rest of `requirements.txt`.
 6. Runs `example_usage.py` on synthetic data as a smoke test.
 
-If `module load python` fails in step 3, do it manually first:
+`research-linux*` ships RHEL 8 with Python 3.6 and no modules, so step 3 will
+land in the Miniconda auto-install branch on first run. Subsequent runs reuse
+the same Miniconda.
 
-```bash
-module avail python            # see what's installed
-module load python/3.11        # or whichever version is listed
-```
-
-and rerun the script.
+If you already have a Python 3.9+ via some other means (pyenv, a previously
+loaded module, your own conda), just run the script — it will pick yours up
+first before trying to install anything.
 
 ---
 
